@@ -251,7 +251,7 @@ if __name__ == '__main__':
                 log_file.write('%s\n' % message)
 
         ### display output images
-        if (step + 1) % opt.sample_freq == 0:
+        if (step + 1) % opt.sample_freq == 0 or step == 0:
             model.netG.eval()
             with torch.no_grad():
                 imgs        = list()
@@ -282,7 +282,7 @@ if __name__ == '__main__':
                 wandb.log({"samples":[wandb.Image(os.path.join(sample_path, 'step_'+str(step+1)+'.jpg'))]}, step=step+1)
 
         ### save latest model
-        if (step+1) % opt.model_freq==0:
+        if (step+1) % opt.model_freq==0 or step == 0:
             print('saving the latest model (steps %d)' % (step+1))
             model.save(step+1)            
             np.savetxt(iter_path, (step+1, total_step), delimiter=',', fmt='%d')
