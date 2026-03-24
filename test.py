@@ -1,8 +1,7 @@
-import dlib
 import numpy as np
 import torch
 import torchvision
-from imutils import face_utils
+from mtcnn_cv2 import MTCNN
 from tqdm import tqdm
 import argparse
 import copy
@@ -64,7 +63,6 @@ class Face:
     def set_attributes(self, age: int, gender: str):
         self.age = age
         self.gender = gender
-        print(age, gender)
 
     def update(self, keypoint: list[tuple[int, int]]):
         self.__init__(keypoint)
@@ -84,6 +82,8 @@ class Face:
 
 
 class FaceSet:
+    latent_ids = np.load("sample_faces/latent_ids.npz")
+
     def __init__(self):
         self.faces = []
         self.nonused_counter = []
@@ -91,6 +91,10 @@ class FaceSet:
     def append(self, face: Face):
         self.faces.append(face)
         self.nonused_counter.append(0)
+
+    def set_attributes(self, i: int, age: int, gender: str):
+        self.faces[i].set_attributes(age, gender)
+        self.faces[i].latent_id = self.latent_ids[f"{age[0]}_{gender[0]}_jp"]
 
     def __len__(self) -> int:
         # s = sum(c == 0 for c in self.nonused_counter)
@@ -138,20 +142,17 @@ class FaceSet:
 
 
 class FaceCropper:
-    def __init__(self, dlib_weight_path: str):
+    def __init__(self):
         self.size = 256
         self.crop_size = 224
-        self.detector = dlib.get_frontal_face_detector()
-        self.predictor = dlib.shape_predictor(dlib_weight_path)
+        self.detector = MTCNN()
 
     def detect_keypoints(self, image: np.ndarray) -> FaceSet:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        height, width = gray.shape
+        height, width = image.shape[:2]
         scale = min(512 / max(height, width), 1.0)
-        gray_down = cv2.resize(gray, (int(width * scale), int(height * scale)))
-
-        faces = self.detector(gray_down, 1)
+        img_down = cv2.resize(image, (int(width * scale), int(height * scale)))
+    
+        faces = self.detector.detect_faces(img_down)
 
         if len(faces) == 0:
             return FaceSet()
@@ -159,21 +160,13 @@ class FaceCropper:
         faces_list = FaceSet()
 
         for face in faces:
-            face = dlib.rectangle(
-                left=int(round(face.left() / scale)),
-                top=int(round(face.top() / scale)),
-                right=int(round(face.right() / scale)),
-                bottom=int(round(face.bottom() / scale)),
-            )
-            shape = self.predictor(gray, face)
-            pts = face_utils.shape_to_np(shape)
+            left_eye = np.array(face["keypoints"]["left_eye"]) / scale
+            right_eye = np.array(face["keypoints"]["right_eye"]) / scale
+            nose = np.array(face["keypoints"]["nose"]) / scale
+            left_mouth = np.array(face["keypoints"]["mouth_left"]) / scale
+            right_mouth = np.array(face["keypoints"]["mouth_right"]) / scale
 
-            nose = pts[27:36]
-            right_eye = pts[36:42]
-            left_eye = pts[42:48]
-            mouth = pts[48:68]
-
-            faces_list.append(Face(keypoint=[right_eye.mean(0), left_eye.mean(0), nose.mean(0), mouth.mean(0)]))
+            faces_list.append(Face(keypoint=[right_eye, left_eye, nose, 0.5*(left_mouth + right_mouth)]))
 
         return faces_list
 
@@ -213,15 +206,12 @@ class FaceCropper:
 
 
 class FaceSwapper:
-    def __init__(self, model_path: str, netArc_checkpoint: str, classifier_checkpoint: str):
+    def __init__(self, model_path: str, classifier_checkpoint: str):
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
         self.generator = MobileGenerator_Adain_Upsample(input_nc=3, output_nc=3, latent_size=512, n_blocks=6, deep=False)
         self.generator.load_state_dict(torch.load(model_path, map_location=torch.device("cpu"), weights_only=False))
         self.generator.to(self.device).eval()
-
-        self.identifier = torch.load(netArc_checkpoint, map_location=torch.device("cpu"), weights_only=False)
-        self.identifier.to(self.device)
 
         self.classifier = MobileNetV3MultiTask(model_name="mobilenetv3_small_100", num_age_classes=10, num_gender_classes=2)
         self.classifier.to(self.device).eval()
@@ -265,37 +255,17 @@ class FaceSwapper:
 
     @torch.no_grad()
     @torch.autocast("cuda", torch.bfloat16)
-    def get_latent_id(self, img: np.ndarray) -> torch.Tensor:
-        img_id = self.np2tensor(img).to(self.device)
-        img_id_downsample = torch.nn.functional.interpolate(img_id, size=(112,112))
-        latend_id = self.identifier(img_id_downsample)
-        latend_id = torch.nn.functional.normalize(latend_id, p=2, dim=1)
-        return latend_id.to("cpu")
-
-    @torch.no_grad()
-    @torch.autocast("cuda", torch.bfloat16)
-    def swap(self, img_att: np.ndarray, latent_id: np.ndarray) -> np.ndarray:
+    def swap(self, img_att: np.ndarray, latent_ids: np.ndarray) -> np.ndarray:
         img_att = self.np2tensor(img_att).to(self.device)
-        latent_id = latent_id.to(self.device).repeat(img_att.size(0), 1)
+        latent_ids = torch.cat([torch.from_numpy(latent_id) for latent_id in latent_ids]).to(self.device)
 
-        output = self.generator(img_att, latent_id)
+        output = self.generator(img_att, latent_ids)
         return self.tensor2np(output.to("cpu"))
 
 
-def swap_image(source_path: str, target_path: str, output_path: str, face_cropper: FaceCropper, face_swapper: FaceSwapper):
-    source_img = cv2.imread(source_path)
+def swap_image(target_path: str, output_path: str, face_cropper: FaceCropper, face_swapper: FaceSwapper):
     target_img = cv2.imread(target_path)
-
-    source_img = cv2.cvtColor(source_img, cv2.COLOR_BGR2RGB)
     target_img = cv2.cvtColor(target_img, cv2.COLOR_BGR2RGB)
-
-    faces = face_cropper.detect_keypoints(source_img)
-    if len(faces) == 0:
-        print(f"No face detected in {source_path}")
-        return
-    face = faces[0]
-    cropped_source = face_cropper.crop_and_resize(source_img, face)
-    latent_id = face_swapper.get_latent_id(cropped_source)
 
     faces = face_cropper.detect_keypoints(target_img)
     if len(faces) == 0:
@@ -313,18 +283,7 @@ def swap_image(source_path: str, target_path: str, output_path: str, face_croppe
     cv2.imwrite(output_path, result)
 
 
-def swap_video(source_path: str, target_path: str, output_path: str, face_cropper: FaceCropper, face_swapper: FaceSwapper, verbose: bool = False):
-    source_img = cv2.imread(source_path)
-    source_img = cv2.cvtColor(source_img, cv2.COLOR_BGR2RGB)
-
-    faces = face_cropper.detect_keypoints(source_img)
-    if len(faces) == 0:
-        print(f"No face detected in {source_path}")
-        return
-    face = faces[0]
-    cropped_source = face_cropper.crop_and_resize(source_img, face)
-    latent_id = face_swapper.get_latent_id(cropped_source)
-
+def swap_video(target_path: str, output_path: str, face_cropper: FaceCropper, face_swapper: FaceSwapper, verbose: bool = False):
     target_video = cv2.VideoCapture(target_path)
     num_frames = int(target_video.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = target_video.get(cv2.CAP_PROP_FPS)
@@ -350,15 +309,19 @@ def swap_video(source_path: str, target_path: str, output_path: str, face_croppe
         result = target_img.copy()
         if len(faces) > 0:
             cropped_targets = []
+            latent_ids = []
             for j, face in enumerate(faces):
-                cropped_targets.append(face_cropper.crop_and_resize(target_img, face))
+                cropped_face = face_cropper.crop_and_resize(target_img, face)
 
-                if not hasattr(faces[j], "age"):
-                    attributes = face_swapper.classify(cropped_targets[j])
+                if not hasattr(face, "age"):
+                    attributes = face_swapper.classify(cropped_face)
                     assert len(attributes) == 1
-                    faces[j].set_attributes(*attributes[0])
+                    faces.set_attributes(j, *attributes[0])
 
-            swapped = face_swapper.swap(cropped_targets, latent_id)
+                cropped_targets.append(cropped_face)
+                latent_ids.append(face.latent_id)
+
+            swapped = face_swapper.swap(cropped_targets, latent_ids)
 
             for k, face in enumerate(faces):
                 result = face_cropper.invert_image(result, swapped[k], face)
@@ -377,20 +340,17 @@ def swap_video(source_path: str, target_path: str, output_path: str, face_croppe
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Face swapping using SimSwap")
-    parser.add_argument("--source", type=str, required=True, help="Path to the source image")
     parser.add_argument("--target", type=str, required=True, help="Path to the target image")
     parser.add_argument("--output", type=str, default="output.png", help="Path to save the output image")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose mode")
-    parser.add_argument("--dlib_weight", type=str, required=True, help="Path to the dlib weight")
     parser.add_argument("--gen_checkpoint", type=str, required=True, help="Path to the generator model")
-    parser.add_argument("--netArc_checkpoint", type=str, default="arcface_model/arcface_checkpoint.tar", help="Path to the ArcFace checkpoint")
     parser.add_argument("--classifier_checkpoint", type=str, default="/content/best_mobilenetv3_multitask.pth", help="Path to the MobileNetV3MultiTask checkpoint")
     args = parser.parse_args()
 
-    face_cropper = FaceCropper(args.dlib_weight)
-    face_swapper = FaceSwapper(args.gen_checkpoint, args.netArc_checkpoint, args.classifier_checkpoint)
+    face_cropper = FaceCropper()
+    face_swapper = FaceSwapper(args.gen_checkpoint, args.classifier_checkpoint)
 
     if args.target.endswith((".mp4", ".avi", ".mov")):
-        swap_video(args.source, args.target, args.output, face_cropper, face_swapper, args.verbose)
+        swap_video(args.target, args.output, face_cropper, face_swapper, args.verbose)
     else:
-        swap_image(args.source, args.target, args.output, face_cropper, face_swapper)
+        swap_image(args.target, args.output, face_cropper, face_swapper)
