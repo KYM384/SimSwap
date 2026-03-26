@@ -1,9 +1,11 @@
 import numpy as np
 import torch
 import torchvision
-from mtcnn_cv2 import MTCNN
+from imutils import face_utils
+from ultralytics import YOLO
 from tqdm import tqdm
 import argparse
+import dlib
 import copy
 import timm
 import cv2
@@ -142,31 +144,38 @@ class FaceSet:
 
 
 class FaceCropper:
-    def __init__(self):
+    def __init__(self, yolo_path: str, dlib_path: str):
         self.size = 256
         self.crop_size = 224
-        self.detector = MTCNN()
+        self.detector = YOLO(yolo_path)
+        self.predictor = dlib.shape_predictor(dlib_path)
 
     def detect_keypoints(self, image: np.ndarray) -> FaceSet:
         height, width = image.shape[:2]
-        scale = min(512 / max(height, width), 1.0)
-        img_down = cv2.resize(image, (int(width * scale), int(height * scale)))
     
-        faces = self.detector.detect_faces(img_down)
-
-        if len(faces) == 0:
+        results = self.detector.predict(image, verbose=False, conf=0.8)
+        pts = results[0].boxes.data.to("cpu").detach().numpy()
+        if len(pts) == 0:
             return FaceSet()
+
+        x0, y0, x1, y1 = pts[:,0], pts[:,1], pts[:,2], pts[:,3]
+        cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+        s = 0.25 * (x1 - x0 + y1 - y0)
+        x0, y0, x1, y1 = cx - s, cy - s, cx + s, cy + s
 
         faces_list = FaceSet()
 
-        for face in faces:
-            left_eye = np.array(face["keypoints"]["left_eye"]) / scale
-            right_eye = np.array(face["keypoints"]["right_eye"]) / scale
-            nose = np.array(face["keypoints"]["nose"]) / scale
-            left_mouth = np.array(face["keypoints"]["mouth_left"]) / scale
-            right_mouth = np.array(face["keypoints"]["mouth_right"]) / scale
+        for i in range(len(pts)):
+            rect = dlib.rectangle(int(x0[i]), int(y0[i]), int(x1[i]), int(y1[i]))
+            shape = self.predictor(image, rect)
+            face = face_utils.shape_to_np(shape)
 
-            faces_list.append(Face(keypoint=[right_eye, left_eye, nose, 0.5*(left_mouth + right_mouth)]))
+            left_eye = face[36:42].mean(0)
+            right_eye = face[42:48].mean(0)
+            nose = face[27:36].mean(0)
+            mouth = face[48:68].mean(0)
+
+            faces_list.append(Face(keypoint=[left_eye, right_eye, nose, mouth]))
 
         return faces_list
 
@@ -195,9 +204,9 @@ class FaceCropper:
         inverted = cv2.warpAffine(cropped, M_inv, (image.shape[1], image.shape[0]), flags=cv2.INTER_LANCZOS4)
 
         mask = np.zeros((self.crop_size, self.crop_size), dtype=np.uint8)
-        mask[16:-16, 16:-16] = 255
-        mask = cv2.warpAffine(mask, M_inv, (image.shape[1], image.shape[0]))
+        mask[8:-8, 8:-8] = 255
         mask = cv2.GaussianBlur(mask, (31, 31), 0)
+        mask = cv2.warpAffine(mask, M_inv, (image.shape[1], image.shape[0]))
         mask = mask.astype(np.float32)[:,:,None] / 255.0
 
         result = image.astype(np.float32) * (1 - mask) + inverted.astype(np.float32) * mask
@@ -273,10 +282,14 @@ def swap_image(target_path: str, output_path: str, face_cropper: FaceCropper, fa
         return
 
     result = target_img.copy()
-    for face in faces:
+    for j, face in enumerate(faces):
         cropped_target = face_cropper.crop_and_resize(target_img, face)
 
-        swapped = face_swapper.swap(cropped_target, latent_id)
+        attributes = face_swapper.classify(cropped_target)
+        faces.set_attributes(j, *attributes[0])
+        latent_id = face.latent_id
+
+        swapped = face_swapper.swap(cropped_target, latent_id)[0]
         result = face_cropper.invert_image(result, swapped, face)
 
     result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
@@ -291,7 +304,10 @@ def swap_video(target_path: str, output_path: str, face_cropper: FaceCropper, fa
     height = int(target_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    if verbose:
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height*2))
+    else:
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     faces = FaceSet()
     for i in tqdm(range(num_frames)):
@@ -299,12 +315,10 @@ def swap_video(target_path: str, output_path: str, face_cropper: FaceCropper, fa
         if not ret:
             break
 
-        frame = cv2.resize(frame, (width, height))
-
         target_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         current_faces = face_cropper.detect_keypoints(target_img)
-        faces.update(current_faces, reset_nonused_threshold=fps*3.0)
+        faces.update(current_faces, reset_nonused_threshold=fps*1.0)
 
         result = target_img.copy()
         if len(faces) > 0:
@@ -331,6 +345,9 @@ def swap_video(target_path: str, output_path: str, face_cropper: FaceCropper, fa
                     result = cv2.putText(result, f"{face.age[0]} {int(face.age[1]*100)}%", (face.bbox[0], face.bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
                     result = cv2.putText(result, f"{face.gender[0]} {int(face.gender[1]*100)}%", (face.bbox[0], face.bbox[1]-30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
 
+        if verbose:
+            result = np.vstack([target_img, result])
+
         result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
         writer.write(result)
 
@@ -345,9 +362,11 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", help="Enable verbose mode")
     parser.add_argument("--gen_checkpoint", type=str, required=True, help="Path to the generator model")
     parser.add_argument("--classifier_checkpoint", type=str, default="/content/best_mobilenetv3_multitask.pth", help="Path to the MobileNetV3MultiTask checkpoint")
+    parser.add_argument("--yolo_path", type=str, required=True, help="Path to the YOLO model")
+    parser.add_argument("--dlib_path", type=str, required=True, help="Path to the dlib model")
     args = parser.parse_args()
 
-    face_cropper = FaceCropper()
+    face_cropper = FaceCropper(args.yolo_path, args.dlib_path)
     face_swapper = FaceSwapper(args.gen_checkpoint, args.classifier_checkpoint)
 
     if args.target.endswith((".mp4", ".avi", ".mov")):
