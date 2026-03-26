@@ -1,9 +1,9 @@
-import numpy as np
 import torch
 import torchvision
 from imutils import face_utils
 from ultralytics import YOLO
 from tqdm import tqdm
+import numpy as np
 import argparse
 import dlib
 import copy
@@ -96,6 +96,8 @@ class FaceSet:
 
     def set_attributes(self, i: int, age: int, gender: str):
         self.faces[i].set_attributes(age, gender)
+        if age[0] == 80 and gender[0] == "M":
+            age[0] = 70
         self.faces[i].latent_id = self.latent_ids[f"{age[0]}_{gender[0]}_jp"]
 
     def __len__(self) -> int:
@@ -152,8 +154,7 @@ class FaceCropper:
 
     def detect_keypoints(self, image: np.ndarray) -> FaceSet:
         height, width = image.shape[:2]
-    
-        results = self.detector.predict(image, verbose=False, conf=0.8)
+        results = self.detector.predict(image, verbose=False, conf=0.7)
         pts = results[0].boxes.data.to("cpu").detach().numpy()
         if len(pts) == 0:
             return FaceSet()
@@ -188,7 +189,7 @@ class FaceCropper:
         M[0, 2] += self.crop_size // 2 - cx
         M[1, 2] += self.crop_size // 2 - cy
 
-        cropped = cv2.warpAffine(image, M, (self.crop_size, self.crop_size), flags=cv2.INTER_LANCZOS4)
+        cropped = cv2.warpAffine(image, M, (self.crop_size, self.crop_size), flags=cv2.INTER_LINEAR)
         return cropped
 
     def invert_image(self, image: np.ndarray, cropped: np.ndarray, face: Face) -> np.ndarray:
@@ -201,7 +202,7 @@ class FaceCropper:
         M[1, 2] += self.crop_size // 2 - cy
 
         M_inv = cv2.invertAffineTransform(M)
-        inverted = cv2.warpAffine(cropped, M_inv, (image.shape[1], image.shape[0]), flags=cv2.INTER_LANCZOS4)
+        inverted = cv2.warpAffine(cropped, M_inv, (image.shape[1], image.shape[0]), flags=cv2.INTER_LINEAR)
 
         mask = np.zeros((self.crop_size, self.crop_size), dtype=np.uint8)
         mask[8:-8, 8:-8] = 255
